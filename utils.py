@@ -1,5 +1,4 @@
 import re
-import math
 
 import numpy as np
 import scipy.sparse as sp
@@ -7,27 +6,11 @@ import torch
 from nltk.tokenize import TweetTokenizer
 from torch.utils.data import Dataset
 
-# ----------------------------
-# (2.1) Binning helpers
-# ----------------------------
-addr_pat = re.compile(r"0x[a-fA-F0-9]{40}")
-
-def to_val_bin(x, n_bins):
-    # log1p binning, clamp
-    x = max(float(x), 0.0)
-    b = int(min(n_bins - 1, max(0, math.floor(math.log1p(x) * (n_bins / 10.0)))))
-    return b
-
-def to_dt_bin(x, n_bins):
-    # dt often large; use log1p too
-    x = max(float(x), 0.0)
-    b = int(min(n_bins - 1, max(0, math.floor(math.log1p(x) * (n_bins / 10.0)))))
-    return b
-
 
 """
 General functions
 """
+
 
 def del_http_user_tokenize(tweet):
     space_pattern = r"\s+"
@@ -40,6 +23,7 @@ def del_http_user_tokenize(tweet):
     tweet = re.sub(url_regex, "", tweet)
     tweet = re.sub(mention_regex, "", tweet)
     return tweet
+
 
 def clean_str(string):
     string = re.sub(r"[^A-Za-z0-9(),!?\'\`]", " ", string)
@@ -57,10 +41,16 @@ def clean_str(string):
     string = re.sub(r"\s{2,}", " ", string)
     return string.strip().lower()
 
+
 def clean_tweet_tokenize(string):
-    tknzr = TweetTokenizer(reduce_len=True, preserve_case=False, strip_handles=False)
+    tknzr = TweetTokenizer(
+        reduce_len=True,
+        preserve_case=False,
+        strip_handles=False,
+    )
     tokens = tknzr.tokenize(string.lower())
     return " ".join(tokens).strip()
+
 
 def normalize_adj(adj):
     rowsum = np.array(adj.sum(1))
@@ -69,26 +59,31 @@ def normalize_adj(adj):
     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
     return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt)
 
+
 def sparse_scipy2torch(coo_sparse):
     coo = coo_sparse.tocoo()
-    i = torch.tensor(np.vstack((coo.row, coo.col)), dtype=torch.long)
-    v = torch.tensor(coo.data, dtype=torch.float32)
-    return torch.sparse_coo_tensor(i, v, size=coo.shape)
+    indices = torch.tensor(np.vstack((coo.row, coo.col)), dtype=torch.long)
+    values = torch.tensor(coo.data, dtype=torch.float32)
+    return torch.sparse_coo_tensor(indices, values, size=coo.shape)
+
 
 def get_class_count_and_weight(y, n_classes):
     classes_count = []
     weight = []
+    total = len(y)
+
     for i in range(n_classes):
         count = np.sum(y == i)
         classes_count.append(count)
-        # tránh chia 0 nếu dataset có class trống
-        weight.append(len(y) / (n_classes * count)) if count > 0 else weight.append(0.0)
+        weight.append(0.0 if count == 0 else total / (n_classes * count))
+
     return classes_count, weight
 
 
 """
-Functions and Classes for read and organize data set
+Functions and classes for dataset processing
 """
+
 
 class InputExample(object):
     def __init__(self, guid, text_a, text_b=None, confidence=None, label=None):
@@ -97,6 +92,7 @@ class InputExample(object):
         self.text_b = text_b
         self.confidence = confidence
         self.label = label
+
 
 class InputFeatures(object):
     def __init__(
@@ -120,138 +116,38 @@ class InputFeatures(object):
         self.label_id = label_id
 
 
-def example2feature(
-    example,
-    tokenizer,
-    gcn_vocab_map,
-    max_seq_len,
-    gcn_embedding_dim,
-    tok_cfg=None,
-    addr_to_tok=None,
-):
-    """
-    Field-aware tokenization:
-    - address: map via addr_to_tok (topK) else ADDR_OOV (default "[UNK]")
-    - key=value parsing: tag/in_out/value(amount)/2-gram..5-gram -> bin tokens from tok_cfg
-    - fallback: keep token as-is
-    """
-    tok_cfg = tok_cfg or {}
-    addr_to_tok = addr_to_tok or {}
+def _truncate_seq_pair(tokens_a, tokens_b, max_length):
+    while True:
+        total_length = len(tokens_a) + len(tokens_b)
+        if total_length <= max_length:
+            break
+        if len(tokens_a) > len(tokens_b):
+            tokens_a.pop()
+        else:
+            tokens_b.pop()
 
-    tokens_a_raw = example.text_a.strip().split()
+
+def example2feature(example, tokenizer, gcn_vocab_map, max_seq_len, gcn_embedding_dim):
+    tokens_a = example.text_a.split()
     assert example.text_b is None
 
-    out_tokens = []
-    gcn_vocab_ids = []
+    if len(tokens_a) > max_seq_len - 1 - gcn_embedding_dim:
+        tokens_a = tokens_a[: (max_seq_len - 1 - gcn_embedding_dim)]
 
-    def push(tok: str):
-        out_tokens.append(tok)
-        if tok in gcn_vocab_map:
-            gcn_vocab_ids.append(gcn_vocab_map[tok])
+    gcn_vocab_ids = []
+    for word in tokens_a:
+        if word in gcn_vocab_map:
+            gcn_vocab_ids.append(gcn_vocab_map[word])
         else:
             gcn_vocab_ids.append(gcn_vocab_map.get("UNK", -1))
 
-    def is_true(v: str) -> bool:
-        return v in ("1", "true", "True", "yes", "Yes", "y", "Y")
-
-    for w in tokens_a_raw:
-        # address?
-        if addr_pat.fullmatch(w):
-            tok = addr_to_tok.get(w, tok_cfg.get("ADDR_OOV", "[UNK]"))
-            push(tok)
-            continue
-
-        # key=value?
-        if "=" in w:
-            k, v = w.split("=", 1)
-            k = k.lower()
-
-            # TAG
-            if k in ("tag",):
-                # require tok_cfg["TAG1"], tok_cfg["TAG0"]
-                push(tok_cfg.get("TAG1", "[UNK]") if is_true(v) else tok_cfg.get("TAG0", "[UNK]"))
-                continue
-
-            # IN/OUT
-            if k in ("in_out", "inout"):
-                push(tok_cfg.get("IN1", "[UNK]") if is_true(v) else tok_cfg.get("IN0", "[UNK]"))
-                continue
-
-            # VALUE/AMOUNT
-            if k in ("value", "amount", "amt"):
-                bins = tok_cfg.get("VAL_BINS", None)
-                if isinstance(bins, (list, tuple)) and len(bins) > 0:
-                    try:
-                        b = to_val_bin(v, len(bins))
-                        push(bins[b])
-                    except Exception:
-                        push(bins[0])
-                else:
-                    push("[UNK]")
-                continue
-
-            # DT bins
-            if k in ("2-gram", "2gram", "dt2"):
-                bins = tok_cfg.get("DT2_BINS", None)
-                if isinstance(bins, (list, tuple)) and len(bins) > 0:
-                    try:
-                        push(bins[to_dt_bin(v, len(bins))])
-                    except Exception:
-                        push(bins[0])
-                else:
-                    push("[UNK]")
-                continue
-
-            if k in ("3-gram", "3gram", "dt3"):
-                bins = tok_cfg.get("DT3_BINS", None)
-                if isinstance(bins, (list, tuple)) and len(bins) > 0:
-                    try:
-                        push(bins[to_dt_bin(v, len(bins))])
-                    except Exception:
-                        push(bins[0])
-                else:
-                    push("[UNK]")
-                continue
-
-            if k in ("4-gram", "4gram", "dt4"):
-                bins = tok_cfg.get("DT4_BINS", None)
-                if isinstance(bins, (list, tuple)) and len(bins) > 0:
-                    try:
-                        push(bins[to_dt_bin(v, len(bins))])
-                    except Exception:
-                        push(bins[0])
-                else:
-                    push("[UNK]")
-                continue
-
-            if k in ("5-gram", "5gram", "dt5"):
-                bins = tok_cfg.get("DT5_BINS", None)
-                if isinstance(bins, (list, tuple)) and len(bins) > 0:
-                    try:
-                        push(bins[to_dt_bin(v, len(bins))])
-                    except Exception:
-                        push(bins[0])
-                else:
-                    push("[UNK]")
-                continue
-
-        # fallback
-        push(w)
-
-    # truncate (keep same as old behavior)
-    max_a = max_seq_len - 1 - gcn_embedding_dim
-    if len(out_tokens) > max_a:
-        out_tokens = out_tokens[:max_a]
-        gcn_vocab_ids = gcn_vocab_ids[:max_a]
-
-    # Build BERT-like tokens
-    tokens = ["[CLS]"] + out_tokens + ["[SEP]" for _ in range(gcn_embedding_dim + 1)]
+    tokens = ["[CLS]"] + tokens_a + ["[SEP]" for _ in range(gcn_embedding_dim + 1)]
     segment_ids = [0] * len(tokens)
 
     input_ids = tokenizer.convert_tokens_to_ids(tokens)
     input_mask = [1] * len(input_ids)
 
-    feat = InputFeatures(
+    return InputFeatures(
         guid=example.guid,
         tokens=tokens,
         input_ids=input_ids,
@@ -261,11 +157,9 @@ def example2feature(
         confidence=example.confidence,
         label_id=example.label,
     )
-    return feat
 
 
 class CorpusDataset(Dataset):
-    # (2.2) updated signature
     def __init__(
         self,
         examples,
@@ -273,17 +167,12 @@ class CorpusDataset(Dataset):
         gcn_vocab_map,
         max_seq_len,
         gcn_embedding_dim,
-        tok_cfg=None,
-        addr_to_tok=None,
     ):
         self.examples = examples
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.gcn_embedding_dim = gcn_embedding_dim
         self.gcn_vocab_map = gcn_vocab_map
-
-        self.tok_cfg = tok_cfg or {}
-        self.addr_to_tok = addr_to_tok or {}
 
     def __len__(self):
         return len(self.examples)
@@ -295,8 +184,6 @@ class CorpusDataset(Dataset):
             self.gcn_vocab_map,
             self.max_seq_len,
             self.gcn_embedding_dim,
-            tok_cfg=self.tok_cfg,
-            addr_to_tok=self.addr_to_tok,
         )
         return (
             feat.input_ids,
@@ -309,30 +196,37 @@ class CorpusDataset(Dataset):
 
     def pad(self, batch):
         gcn_vocab_size = len(self.gcn_vocab_map)
-        seqlen_list = [len(sample[0]) for sample in batch]
-        maxlen = int(np.max(seqlen_list))
+        seq_lens = [len(sample[0]) for sample in batch]
+        max_len = np.max(seq_lens)
 
-        f_collect = lambda x: [sample[x] for sample in batch]
-        f_pad = lambda x, seqlen: [
-            sample[x] + [0] * (seqlen - len(sample[x])) for sample in batch
+        def collect(i):
+            return [sample[i] for sample in batch]
+
+        def pad_1d(i, target_len):
+            return [
+                sample[i] + [0] * (target_len - len(sample[i]))
+                for sample in batch
+            ]
+
+        def pad_gcn_ids(i, target_len):
+            return [
+                [-1] + sample[i] + [-1] * (target_len - len(sample[i]) - 1)
+                for sample in batch
+            ]
+
+        batch_input_ids = torch.tensor(pad_1d(0, max_len), dtype=torch.long)
+        batch_input_mask = torch.tensor(pad_1d(1, max_len), dtype=torch.long)
+        batch_segment_ids = torch.tensor(pad_1d(2, max_len), dtype=torch.long)
+        batch_confidences = torch.tensor(collect(3), dtype=torch.float)
+        batch_label_ids = torch.tensor(collect(4), dtype=torch.long)
+
+        batch_gcn_vocab_ids_padded = np.array(pad_gcn_ids(5, max_len)).reshape(-1)
+        batch_gcn_swop_eye = torch.eye(gcn_vocab_size + 1)[batch_gcn_vocab_ids_padded][
+            :, :-1
         ]
-        f_pad2 = lambda x, seqlen: [
-            [-1] + sample[x] + [-1] * (seqlen - len(sample[x]) - 1)
-            for sample in batch
-        ]
-
-        batch_input_ids = torch.tensor(f_pad(0, maxlen), dtype=torch.long)
-        batch_input_mask = torch.tensor(f_pad(1, maxlen), dtype=torch.long)
-        batch_segment_ids = torch.tensor(f_pad(2, maxlen), dtype=torch.long)
-        batch_confidences = torch.tensor(f_collect(3), dtype=torch.float)
-        batch_label_ids = torch.tensor(f_collect(4), dtype=torch.long)
-
-        batch_gcn_vocab_ids_paded = np.array(f_pad2(5, maxlen)).reshape(-1)
-
-        # NOTE: -1 indexes the last element in torch indexing.
-        # This matches your old behavior where -1 maps to "padding row" and then we slice [:, :-1]
-        batch_gcn_swop_eye = torch.eye(gcn_vocab_size + 1)[batch_gcn_vocab_ids_paded][:, :-1]
-        batch_gcn_swop_eye = batch_gcn_swop_eye.view(len(batch), -1, gcn_vocab_size).transpose(1, 2)
+        batch_gcn_swop_eye = batch_gcn_swop_eye.view(
+            len(batch), -1, gcn_vocab_size
+        ).transpose(1, 2)
 
         return (
             batch_input_ids,
